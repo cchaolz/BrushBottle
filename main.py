@@ -228,7 +228,7 @@ class GameWindow:
 
             # 设为前台窗口
             win32gui.SetForegroundWindow(self.hwnd)
-            time.sleep(0.2)  # 等待窗口前台化
+            time.sleep(0.1)  # 等待窗口前台化
 
             # 再次检查是否成功设置为前台
             if self.is_foreground():
@@ -252,7 +252,7 @@ class GameWindow:
         time.sleep(delay)
         return True
 
-    def drag(self, start_pos, end_pos, duration=0.5, delay=0.5):
+    def drag(self, start_pos, end_pos, duration=0.2, delay=0.1):
         """从起点拖动到终点"""
         # if not self.set_foreground():
         #     logger.error("拖动失败: 无法将窗口设为前台")
@@ -492,50 +492,56 @@ class AutoTeamPirate(QThread):
                     # 检查窗口是否有效
                     if not self.game_window.is_valid():
                         self.log_message.emit("游戏窗口无效，请重新选择窗口")
-                        time.sleep(5)
+                        self.stop()
                         continue
 
                     # 执行自动化流程
                     self.execute_team_pirate_workflow()
 
                 # 短暂延迟
-                time.sleep(1)
+                time.sleep(0.2)
             except Exception as e:
                 self.log_message.emit(f"错误: {str(e)}")
                 time.sleep(5)  # 出错后等待一段时间
 
-    def find_template(self, template_name, screenshot=None, click=False, log=True, threshold=None, delay=0.5, check_target_temp=None):
-        # 截图
-        if screenshot is None:
-            screenshot = self.game_window.capture_screenshot()
-            if screenshot is None:
-                self.log_message.emit("截图失败")
-                return False
+    def find_template(self, template_name, screenshot=None, click=False, log=True, threshold=None, delay=0.2, check_target_temp=None, try_count=1):
+        bNewScreenShot = screenshot is None
+        while try_count > 0:
+            try_count -= 1
+            # 截图
+            if bNewScreenShot:
+                screenshot = self.game_window.capture_screenshot()
+                if screenshot is None:
+                    self.log_message.emit("截图失败")
+                    return False
 
-        # 步骤1: 查找并点击联盟图标
-        self.status_update.emit(f"正在查找{template_name}图标...")
-        found, position, score = self.template_engine.find_template(template_name, screenshot, threshold)
+            # 步骤1: 查找并点击图标
+            self.status_update.emit(f"正在查找{template_name}图标...")
+            found, position, score = self.template_engine.find_template(template_name, screenshot, threshold)
 
-        if found:
-            if log and not click:
-                self.log_message.emit(f"找到{template_name}图标，位置：{position}，匹配度：{score:.4f}")
-            if click:
-                if log:
-                    self.log_message.emit(f"点击{template_name}图标，位置：{position}，匹配度：{score:.4f}")
+            if found:
+                if log and not click:
+                    self.log_message.emit(f"找到{template_name}图标，位置：{position}，匹配度：{score:.4f}")
+                if click:
+                    if log:
+                        self.log_message.emit(f"点击{template_name}图标，位置：{position}，匹配度：{score:.4f}")
 
-                retry = 0
-                while retry < 5:
-                    self.game_window.click(position)
-                    time.sleep(delay)  # 等待界面切换
-                    if check_target_temp is None or self.find_template(check_target_temp, threshold=threshold, log=False):
-                        break
+                    retry = 0
+                    while retry < 5:
+                        self.game_window.click(position)
+                        time.sleep(delay)  # 等待界面切换
+                        if check_target_temp is None or self.find_template(check_target_temp, threshold=threshold, log=False):
+                            break
 
-                    retry += 1
-                    time.sleep(0.05)
+                        retry += 1
+                        time.sleep(0.1)
 
-            return True
-        else:
-            return False
+                return True
+
+            if try_count > 0:
+                time.sleep(0.1)
+
+        return False
 
     def back(self):
         if not self.find_template("return", click=True, log=False):
@@ -573,8 +579,8 @@ class AutoTeamPirate(QThread):
         if self.force_open_bottle or self.idle_count >= 10:
             self.try_open_bottle()
 
-        if self.game_window.is_foreground():
-            self.game_window.click((0, -20), up=False)
+        # if self.game_window.is_foreground():
+        #     self.game_window.click((0, -20), up=False)
 
     def try_open_bottle(self):
         self.idle_count = 0
@@ -616,44 +622,42 @@ class AutoTeamPirate(QThread):
         bRet = False
         # 进背包
         retry = 0
-        while not bRet and retry < 5:
+        while not bRet and retry < 2:
             self.back()
-            self.find_template("unfold1", click=True, log=False, threshold=0.95) or self.find_template("unfold2", click=True, log=False, threshold=0.95)
-            bRet = self.find_template("bag", click=True, log=False, threshold=0.95, check_target_temp="bag_activity")
+            self.find_template("unfold1", click=True, log=False, threshold=0.95) or self.find_template("unfold2", click=True, log=False, threshold=0.95, try_count=2)
+            bRet = self.find_template("bag", click=True, log=False, threshold=0.95, check_target_temp="bag_activity", try_count=2)
             retry += 1
 
         # 进活动背包
         if bRet:
             self.log_message.emit("成功进入背包...")
-            bRet = self.find_template("bag_activity", click=True, log=False, threshold=0.95, check_target_temp="bag_activity_done")
+            bRet = self.find_template("bag_activity", click=True, log=False, delay=0.5, threshold=0.95, check_target_temp="bag_activity_done", try_count=3)
 
         # 找到并点击瓶子
         if bRet:
             self.log_message.emit("成功进入活动背包...")
-            self.game_window.drag((550, 450), (550, 50))
+            self.game_window.drag((550, 450), (550, 50), duration=0.5, delay=0.2)
             bRet = self.find_template("bottle", click=True, log=False, threshold=0.95)
             if not bRet:
-                self.game_window.drag((550, 450), (550, 50))
+                self.game_window.drag((550, 450), (550, 50), duration=0.5, delay=0.2)
                 bRet = self.find_template("bottle", click=True, log=False, threshold=0.95)
 
         # 使用瓶子
         if bRet:
             self.log_message.emit("找到瓶子...")
             bRet = self.find_template("use_item", click=True, log=False, threshold=0.95)
-
-        if bRet:
-            self.log_message.emit("使用瓶子...")
-            bRet = self.process_create_team(template="gofighting", check_target_temp="create_team")
+            if bRet:
+                self.log_message.emit("使用瓶子...")
 
         retry = 0
-        while retry == 0 or (not bRet and retry < 5):
+        while (bRet and retry == 0) or (not bRet and 0 < retry < 5):
+            bRet = self.process_create_team(template="gofighting2", check_target_temp="create_team")
             if bRet:
                 self.log_message.emit("组队进攻...")
-                bRet = self.process_create_team(template="create_team")
-
+            bRet = self.process_create_team(template="create_team")
             if bRet:
                 self.log_message.emit("发起组队...")
-                bRet = self.process_go_fight()
+            bRet = self.process_go_fight()
 
             retry += 1
 
@@ -666,7 +670,7 @@ class AutoTeamPirate(QThread):
         while not bRet and nRetry < retry:
             bRet = self.find_template(template, click=True, log=False, threshold=threshold, check_target_temp=check_target_temp)
             nRetry += 1
-            time.sleep(0.5)
+            time.sleep(0.1)
 
         return bRet
 
@@ -677,7 +681,7 @@ class AutoTeamPirate(QThread):
         while not bRet and nRetry < 5:
             bRet = self.select_free_team(["freeteam3", "freeteam4"], drag_delay=1)
             nRetry += 1
-            time.sleep(0.5)
+            time.sleep(0.1)
 
         return bRet
 
@@ -707,7 +711,7 @@ class AutoTeamPirate(QThread):
 
             # 点击该位置
             self.game_window.click((pos_x, pos_y))
-            time.sleep(0.2)
+            time.sleep(0.1)
 
             # 检查是否是海盗队伍
             screenshot = self.game_window.capture_screenshot()
@@ -749,10 +753,10 @@ class AutoTeamPirate(QThread):
 
         return bSuccess
 
-    def select_free_team(self, listFreeTemplate=None, bFirstTime=True, drag_delay=0.5):
+    def select_free_team(self, listFreeTemplate=None, bFirstTime=True, drag_delay=0.1):
         """选择空闲的队伍位置"""
         if listFreeTemplate is None:
-            listFreeTemplate = ["freeteam1", "freeteam2", "freeteam3", "freeteam4"]
+            listFreeTemplate = ["freeteam1", "freeteam3", "freeteam2", "freeteam4"]
 
         self.status_update.emit("正在查找空闲队伍位置...")
         screenshot = self.game_window.capture_screenshot()
@@ -767,15 +771,16 @@ class AutoTeamPirate(QThread):
 
                 retry = 0
                 while retry < 3:
-                    # 点击偏移位置
-                    offset_pos = (position[0] - 50, position[1] + 50)
-                    self.game_window.click(offset_pos)
-                    time.sleep(0.2)
+                    if template_name != "freeteam1" and template_name != "freeteam3": # 已经是选中的队伍，不用再选
+                        # 点击偏移位置
+                        offset_pos = (position[0] - 50, position[1] + 50)
+                        self.game_window.click(offset_pos)
+                        time.sleep(0.01)
 
                     # 查找并点击确认加入按钮
                     if self.find_template("gojoin", click=True):
                         self.log_message.emit("找到确认加入按钮，点击加入")
-                        time.sleep(0.1)  # 等待加入完成
+                        time.sleep(0.01)  # 等待加入完成
                         if not self.find_template("gojoin"):
                             self.back()
                             return True
@@ -1095,6 +1100,8 @@ class MainWindow(QMainWindow):
 
     def test_template(self):
         """测试当前模板"""
+        screenshot = self.game_window.capture_screenshot()  # 先截个屏
+
         template_name = self.test_template_edit.text()
         if not template_name:
             self.add_log("请输入要测试的模板名称")
@@ -1104,7 +1111,6 @@ class MainWindow(QMainWindow):
             self.add_log(f"模板 '{template_name}' 不存在")
             return
 
-        screenshot = self.game_window.capture_screenshot()
         if screenshot is not None:
             self.template_engine.find_template(template_name, screenshot, log2wnd=True)
 
@@ -1119,7 +1125,6 @@ class MainWindow(QMainWindow):
 
         # 这里可以实现一个模板截取功能
         # 例如让用户在当前游戏窗口截图上选择区域，然后保存为新模板
-        # 简化版本，可以直接使用当前截图
         self.add_log("模板截取功能待实现")
 
     def browse_templates(self):
