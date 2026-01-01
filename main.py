@@ -998,12 +998,16 @@ class MainWindow(QMainWindow):
         self.add_log(f"已加载 {len(self.template_engine.templates)} 个模板")
 
     def register_hotkeys(self):
-        # 注册 Ctrl+F6 为开始热键
-        win32gui.RegisterHotKey(self.winId(), 1, win32con.MOD_CONTROL, win32con.VK_F6)
-        # 注册 Ctrl+F7 为暂停/继续热键
-        win32gui.RegisterHotKey(self.winId(), 2, win32con.MOD_CONTROL, win32con.VK_F7)
-        # 注册 Ctrl+F8 为停止热键
-        win32gui.RegisterHotKey(self.winId(), 3, win32con.MOD_CONTROL, win32con.VK_F8)
+        try:
+            # 注册 Ctrl+F6 为开始热键
+            win32gui.RegisterHotKey(self.winId(), 1, win32con.MOD_CONTROL, win32con.VK_F6)
+            # 注册 Ctrl+F7 为暂停/继续热键
+            win32gui.RegisterHotKey(self.winId(), 2, win32con.MOD_CONTROL, win32con.VK_F7)
+            # 注册 Ctrl+F8 为停止热键
+            win32gui.RegisterHotKey(self.winId(), 3, win32con.MOD_CONTROL, win32con.VK_F8)
+        except Exception as e:
+            self.add_log(f"注册热键失败: {e}")
+            pass
 
     def nativeEvent(self, eventType, message):
         if eventType == "windows_generic_MSG":
