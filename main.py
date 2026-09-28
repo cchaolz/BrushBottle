@@ -19,6 +19,9 @@ from PIL import Image
 from mouse import send_input_click, send_input_rclick
 import ctypes
 
+# PrintWindow 标志: 读取 GPU/DirectX 渲染内容
+PW_RENDERFULLCONTENT = 0x00000002
+
 window = None
 # 设置日志
 logging.basicConfig(
@@ -159,19 +162,25 @@ class GameWindow:
             save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
             save_dc.SelectObject(save_bitmap)
 
-            # 复制屏幕到位图
-            save_dc.BitBlt((0, 0), (width, height), mfc_dc, (0, 0), win32con.SRCCOPY)
+            def read_bitmap():
+                info = save_bitmap.GetInfo()
+                buf = save_bitmap.GetBitmapBits(True)
+                return np.array(Image.frombuffer(
+                    'RGB', (info['bmWidth'], info['bmHeight']),
+                    buf, 'raw', 'BGRX', 0, 1))
 
-            # 转换为PIL图像
-            bmpinfo = save_bitmap.GetInfo()
-            bmpstr = save_bitmap.GetBitmapBits(True)
-            img = Image.frombuffer(
-                'RGB',
-                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                bmpstr, 'raw', 'BGRX', 0, 1)
+            # GPU/DirectX 渲染的窗口用 BitBlt 只能拿到黑屏，必须用 PrintWindow
+            printed = ctypes.windll.user32.PrintWindow(
+                self.hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+            frame = read_bitmap()
+
+            if not printed or not frame.any():
+                # PrintWindow 无效时回退 BitBlt
+                save_dc.BitBlt((0, 0), (width, height), mfc_dc, (0, 0), win32con.SRCCOPY)
+                frame = read_bitmap()
 
             # 转换为OpenCV格式
-            screenshot = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            screenshot = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             # 清理资源
             win32gui.DeleteObject(save_bitmap.GetHandle())
@@ -188,7 +197,7 @@ class GameWindow:
 
             return screenshot
         except Exception as e:
-            self.log(f"截图失败: {e}")
+            logger.error(f"截图失败: {e}")
             return None
 
     def window_to_screen_position(self, window_pos):
@@ -479,6 +488,7 @@ class AutoTeamPirate(QThread):
         self.count = 0
         self.idle_count = 0
         self.force_open_bottle = False
+        self.m_nNotFoundBottleCount = 0
 
     def run(self):
         """运行自动组队打海盗流程"""
@@ -556,7 +566,7 @@ class AutoTeamPirate(QThread):
             win32gui.ShowWindow(self.game_window.hwnd, win32con.SW_RESTORE)
 
         """执行自动组队打海盗流程"""
-        bAnySuccess = self.find_template("league", click=True)
+        bAnySuccess = self.find_template("league", click=True) or self.find_template("empire", click=True)
         bAnySuccess = self.find_template("wars", click=True) or bAnySuccess
         bAnySuccess = self.process_join_teams() or bAnySuccess
         if not bAnySuccess:
@@ -585,7 +595,7 @@ class AutoTeamPirate(QThread):
     def try_open_bottle(self):
         self.idle_count = 0
 
-        if not window.open_bottle_checkbox.isChecked() and not self.force_open_bottle:
+        if not window.open_bottle_checkbox.isChecked() and not window.open_activity_bottle_checkbox.isChecked() and not self.force_open_bottle:
             return
 
         self.force_open_bottle = False
@@ -613,7 +623,8 @@ class AutoTeamPirate(QThread):
             time.sleep(0.3)
             bRet = self.find_template("cfreeteam1", click=False, log=False, threshold=0.9) \
                    or self.find_template("cfreeteam2", click=False, log=False, threshold=0.8) \
-                   or self.find_template("cfreeteam3", click=False, log=False, threshold=0.8)
+                   or self.find_template("cfreeteam3", click=False, log=False, threshold=0.8) \
+                   or self.find_template("cfreeteam4", click=False, log=False, threshold=0.8)
 
         return bRet
 
@@ -636,18 +647,27 @@ class AutoTeamPirate(QThread):
         # 找到并点击瓶子
         if bRet:
             self.log_message.emit("成功进入活动背包...")
+            szBottleName = "bottle_activity" if window.open_activity_bottle_checkbox.isChecked() else "bottle"
             self.game_window.drag((550, 450), (550, 50), duration=0.5, delay=0.2)
-            bRet = self.find_template("bottle", click=True, log=False, threshold=0.95)
+            bRet = self.find_template(szBottleName, click=True, log=False, threshold=0.95)
             if not bRet:
                 self.game_window.drag((550, 450), (550, 50), duration=0.5, delay=0.2)
-                bRet = self.find_template("bottle", click=True, log=False, threshold=0.95)
+                bRet = self.find_template(szBottleName, click=True, log=False, threshold=0.95)
 
         # 使用瓶子
         if bRet:
+            self.m_nNotFoundBottleCount = 0
             self.log_message.emit("找到瓶子...")
             bRet = self.find_template("use_item", click=True, log=False, threshold=0.95)
             if bRet:
                 self.log_message.emit("使用瓶子...")
+        else:
+            self.m_nNotFoundBottleCount += 1
+            if self.m_nNotFoundBottleCount >= 5:
+                self.m_nNotFoundBottleCount = 0
+                window.open_bottle_checkbox.setChecked(False)
+                window.open_activity_bottle_checkbox.setChecked(False)
+                self.log_message.emit("连续5次未找到瓶子，关闭开瓶子选项...")
 
         retry = 0
         while (bRet and retry == 0) or (not bRet and 0 < retry < 5):
@@ -895,9 +915,6 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_automation)
         control_layout.addWidget(self.stop_button)
 
-        # 注册全局热键
-        self.register_hotkeys()
-
         window_layout = QHBoxLayout()
         control_layout.addLayout(window_layout)
         # 单选框（自动关闭通知消息）
@@ -914,7 +931,14 @@ class MainWindow(QMainWindow):
         # 单选框（自动开瓶子）
         self.open_bottle_checkbox = QCheckBox("自动开瓶子")
         self.open_bottle_checkbox.setChecked(False)
+        self.open_bottle_checkbox.stateChanged.connect(self.on_open_bottle_checkbox)
         window_layout.addWidget(self.open_bottle_checkbox)
+
+        # 单选框（自动开活动瓶子）
+        self.open_activity_bottle_checkbox = QCheckBox("自动开活动瓶子")
+        self.open_activity_bottle_checkbox.setChecked(False)
+        self.open_activity_bottle_checkbox.stateChanged.connect(self.on_open_activity_bottle_checkbox)
+        window_layout.addWidget(self.open_activity_bottle_checkbox)
 
         # 防卡死数字编辑框
         window_layout = QHBoxLayout()
@@ -992,6 +1016,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         self.screenshot_update.connect(self.update_screenshot)
+
+        # 注册全局热键
+        self.register_hotkeys()
 
         # 添加日志信息
         self.add_log("程序已启动")
@@ -1144,6 +1171,14 @@ class MainWindow(QMainWindow):
             self.add_log(f"已打开模板目录: {template_dir}")
         else:
             self.add_log(f"模板目录不存在: {template_dir}")
+
+    def on_open_bottle_checkbox(self, state):
+        if state == Qt.Checked:
+            self.open_activity_bottle_checkbox.setChecked(False)
+
+    def on_open_activity_bottle_checkbox(self, state):
+        if state == Qt.Checked:
+            self.open_bottle_checkbox.setChecked(False)
 
     def closeEvent(self, event):
         """关闭窗口事件处理"""
