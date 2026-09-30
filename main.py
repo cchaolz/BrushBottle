@@ -10,11 +10,11 @@ import time
 import logging
 import win32ui
 from datetime import datetime
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QTextEdit, QComboBox,
-                             QGroupBox, QListWidget, QDialog, QDialogButtonBox, QCheckBox, QLineEdit)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt5.QtGui import QPixmap, QImage, QIcon
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                               QPushButton, QLabel, QTextEdit, QComboBox,
+                               QGroupBox, QListWidget, QDialog, QDialogButtonBox, QCheckBox, QLineEdit)
+from PySide6.QtCore import Qt, QTimer, Signal, QThread
+from PySide6.QtGui import QPixmap, QImage, QIcon
 
 from PIL import Image
 from mouse import send_input_click, send_input_rclick
@@ -41,6 +41,22 @@ def get_base_dir():
 
 BASE_DIR = get_base_dir()
 
+
+def get_resource_path(name):
+    """资源路径: 优先 exe/脚本同级目录, 其次打包器内部目录(_MEIPASS)"""
+    external = os.path.join(BASE_DIR, name)
+    if os.path.exists(external):
+        return external
+
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        internal = os.path.join(meipass, name)
+        if os.path.exists(internal):
+            return internal
+
+    return external
+
+
 window = None
 # 设置日志
 logging.basicConfig(
@@ -52,6 +68,25 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("AutoPirateTeam")
+
+
+def find_window(title_keyword):
+    """按标题查找窗口: 先精确匹配, 再匹配标题包含关键字(忽略大小写)"""
+    hwnd = win32gui.FindWindow(None, title_keyword)
+    if hwnd:
+        return hwnd, win32gui.GetWindowText(hwnd)
+
+    matched = []
+
+    def enum_callback(h, _):
+        if win32gui.IsWindowVisible(h):
+            title = win32gui.GetWindowText(h)
+            if title and title_keyword.lower() in title.lower():
+                matched.append((h, title))
+        return True
+
+    win32gui.EnumWindows(enum_callback, None)
+    return matched[0] if matched else (None, None)
 
 
 class WindowSelector(QDialog):
@@ -320,7 +355,7 @@ class TemplateMatchingEngine:
             templates_dir: 模板图片目录
             threshold: 匹配阈值
         """
-        self.templates_dir = templates_dir or os.path.join(BASE_DIR, "templates")
+        self.templates_dir = templates_dir or get_resource_path("templates")
         self.threshold = threshold
         self.templates = {}
         self.template_dimensions = {}
@@ -495,8 +530,8 @@ class AutoTeamPirate(QThread):
     """自动组队打海盗线程"""
 
     # 定义信号
-    status_update = pyqtSignal(str)
-    log_message = pyqtSignal(str)
+    status_update = Signal(str)
+    log_message = Signal(str)
 
     def __init__(self, template_engine, game_window):
         super().__init__()
@@ -877,26 +912,30 @@ class AutoTeamPirate(QThread):
 class MainWindow(QMainWindow):
     """主窗口类"""
 
-    screenshot_update = pyqtSignal(QPixmap)
+    screenshot_update = Signal(QPixmap)
 
-    def __init__(self, monitor_title="云重返帝国"):
+    def __init__(self, monitor_titles=("AoE", "云重返帝国")):
         super().__init__()
         self.template_engine = TemplateMatchingEngine()
         self.game_window = GameWindow()
         self.auto_thread = None
 
         self.init_ui()
-        self.init_window(monitor_title)
+        self.init_window(monitor_titles)
 
-    def init_window(self, monitor_title):
+    def init_window(self, monitor_titles):
         try:
-            game_hwnd = win32gui.FindWindow(None, monitor_title)
-            if game_hwnd != 0:
-                self.game_window.set_window(game_hwnd, monitor_title)
-                self.start_button.setEnabled(True)
-                self.current_window_label.setText(f"{monitor_title} (hwnd: {game_hwnd})")
-            else:
-                self.select_game_window()
+            for keyword in monitor_titles:
+                game_hwnd, title = find_window(keyword)
+                if game_hwnd:
+                    self.game_window.set_window(game_hwnd, title)
+                    self.start_button.setEnabled(True)
+                    self.current_window_label.setText(f"{title} (hwnd: {game_hwnd})")
+                    self.add_log(f"已自动选择窗口: {title} (hwnd: {game_hwnd})")
+                    return
+
+            self.add_log(f"未找到窗口 {'/'.join(monitor_titles)}，请手动选择")
+            self.select_game_window()
         except Exception as e:
             print(f"查找窗口时发生错误: {e}")
             return None
@@ -1031,7 +1070,7 @@ class MainWindow(QMainWindow):
         screen_panel = QGroupBox("当前画面")
         screen_layout = QVBoxLayout()
         self.screen_label = QLabel()
-        self.screen_label.setAlignment(Qt.AlignCenter)
+        self.screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         screen_layout.addWidget(self.screen_label)
         screen_panel.setLayout(screen_layout)
         main_layout.addWidget(screen_panel, 2)
@@ -1053,18 +1092,18 @@ class MainWindow(QMainWindow):
     def register_hotkeys(self):
         try:
             # 注册 Ctrl+F6 为开始热键
-            win32gui.RegisterHotKey(self.winId(), 1, win32con.MOD_CONTROL, win32con.VK_F6)
+            win32gui.RegisterHotKey(int(self.winId()), 1, win32con.MOD_CONTROL, win32con.VK_F6)
             # 注册 Ctrl+F7 为暂停/继续热键
-            win32gui.RegisterHotKey(self.winId(), 2, win32con.MOD_CONTROL, win32con.VK_F7)
+            win32gui.RegisterHotKey(int(self.winId()), 2, win32con.MOD_CONTROL, win32con.VK_F7)
             # 注册 Ctrl+F8 为停止热键
-            win32gui.RegisterHotKey(self.winId(), 3, win32con.MOD_CONTROL, win32con.VK_F8)
+            win32gui.RegisterHotKey(int(self.winId()), 3, win32con.MOD_CONTROL, win32con.VK_F8)
         except Exception as e:
             self.add_log(f"注册热键失败: {e}")
             pass
 
     def nativeEvent(self, eventType, message):
         if eventType == "windows_generic_MSG":
-            msg = ctypes.wintypes.MSG.from_address(message.__int__())
+            msg = ctypes.wintypes.MSG.from_address(int(message))
             if msg.message == win32con.WM_HOTKEY:
                 if msg.wParam == 1:  # Ctrl+F6
                     self.start_automation()
@@ -1080,15 +1119,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # 注销所有热键
         for i in range(1, 4):
-            win32gui.UnregisterHotKey(self.winId(), i)
+            win32gui.UnregisterHotKey(int(self.winId()), i)
         super().closeEvent(event)
 
     def select_game_window(self):
         """选择游戏窗口"""
         dialog = WindowSelector(self)
-        result = dialog.exec_()
+        result = dialog.exec()
 
-        if result == QDialog.Accepted:
+        if result == QDialog.DialogCode.Accepted:
             hwnd, title = dialog.get_selected_window()
             if hwnd:
                 self.game_window.set_window(hwnd, title)
@@ -1111,8 +1150,8 @@ class MainWindow(QMainWindow):
         scaled_pixmap = pixmap.scaled(
             self.screen_label.width(),
             self.screen_label.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
         )
         self.screen_label.setPixmap(scaled_pixmap)
 
@@ -1199,11 +1238,11 @@ class MainWindow(QMainWindow):
             self.add_log(f"模板目录不存在: {template_dir}")
 
     def on_open_bottle_checkbox(self, state):
-        if state == Qt.Checked:
+        if state == Qt.CheckState.Checked:
             self.open_activity_bottle_checkbox.setChecked(False)
 
     def on_open_activity_bottle_checkbox(self, state):
-        if state == Qt.Checked:
+        if state == Qt.CheckState.Checked:
             self.open_bottle_checkbox.setChecked(False)
 
     def closeEvent(self, event):
@@ -1248,7 +1287,7 @@ if __name__ == "__main__":
         logger.warning("未获得管理员权限，继续以普通权限运行")
 
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(os.path.join(BASE_DIR, "icon.png")))
+    app.setWindowIcon(QIcon(get_resource_path("icon.png")))
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

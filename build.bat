@@ -1,4 +1,3 @@
-pyinstaller --onedir --noconfirm -i icon.png -w main.py
+py -3.13 -m PyInstaller --onedir --noconfirm --contents-directory _internal -i icon.png -w --add-data "icon.png;." main.py
 xcopy /E /I /Y templates dist\main\templates
-xcopy /Y icon.png dist\main\
 pause
