@@ -12,9 +12,9 @@ import win32ui
 from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLabel, QTextEdit, QComboBox, QInputDialog,
-                               QMessageBox, QListWidgetItem,
+                               QMessageBox, QListWidgetItem, QScrollArea, QSplitter, QSizePolicy,
                                QGroupBox, QListWidget, QDialog, QDialogButtonBox, QCheckBox, QLineEdit)
-from PySide6.QtCore import QRect, QSettings, Qt, QTimer, Signal, QThread
+from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, Signal, QThread
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QImage, QIcon
 
 from PIL import Image
@@ -58,13 +58,23 @@ def get_resource_path(name):
     return external
 
 
+def get_log_path():
+    """日志文件路径: 同级 log 目录, 目录建不出来则退回同级"""
+    log_dir = os.path.join(BASE_DIR, "log")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, "auto_pirate_team.log")
+    except OSError:
+        return os.path.join(BASE_DIR, "auto_pirate_team.log")
+
+
 window = None
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(BASE_DIR, "auto_pirate_team.log")),
+        logging.FileHandler(get_log_path()),
         logging.StreamHandler()
     ]
 )
@@ -246,6 +256,9 @@ class CaptureLabel(QLabel):
 class TemplateCaptureDialog(QDialog):
     """模板截取对话框: 按所需模板清单, 从游戏截图截取贴图存为指定分辨率"""
 
+    ZOOM_LEVELS = (0.25, 0.5, 1.0, 2.0, 4.0)
+    DEFAULT_ZOOM_INDEX = 2  # 100%, 即按原图尺寸显示
+
     def __init__(self, game_window, template_engine, resolution, parent=None):
         super().__init__(parent)
         self.game_window = game_window
@@ -261,14 +274,49 @@ class TemplateCaptureDialog(QDialog):
         self.resize(1200, 720)
         os.makedirs(self.target_dir, exist_ok=True)
 
-        # 左侧: 所需模板清单 + 参考贴图
+        # 左侧: 所需模板清单 + 当前目标 / 参考贴图对比
         self.template_list = QListWidget()
         self.template_list.currentItemChanged.connect(self.on_template_selected)
 
+        self.current_pixmap = None
+        self.reference_pixmap = None
+        self.zoom_index = self.DEFAULT_ZOOM_INDEX
+
+        self.current_label = QLabel("未截取")
+        self.current_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.reference_label = QLabel("其他分辨率无此贴图")
         self.reference_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.reference_label.setMinimumHeight(160)
-        self.reference_label.setStyleSheet("border: 1px solid #808080;")
+
+        current_layout = QVBoxLayout()
+        current_layout.addWidget(QLabel(f"当前目标（{resolution}）:"))
+        current_layout.addWidget(self.wrap_preview(self.current_label))
+
+        self.reference_title = QLabel("参考（其他分辨率）:")
+
+        reference_layout = QVBoxLayout()
+        reference_layout.addWidget(self.reference_title)
+        reference_layout.addWidget(self.wrap_preview(self.reference_label))
+
+        compare_layout = QHBoxLayout()
+        compare_layout.addLayout(reference_layout)
+        compare_layout.addLayout(current_layout)
+
+        self.zoom_label = QLabel("")
+        self.zoom_out_button = QPushButton("缩小")
+        self.zoom_out_button.clicked.connect(lambda: self.change_zoom(-1))
+        self.zoom_in_button = QPushButton("放大")
+        self.zoom_in_button.clicked.connect(lambda: self.change_zoom(1))
+        self.zoom_reset_button = QPushButton("1:1")
+        self.zoom_reset_button.clicked.connect(self.reset_zoom)
+
+        zoom_layout = QHBoxLayout()
+        zoom_layout.addWidget(QLabel("缩放:"))
+        zoom_layout.addWidget(self.zoom_out_button)
+        zoom_layout.addWidget(self.zoom_in_button)
+        zoom_layout.addWidget(self.zoom_reset_button)
+        zoom_layout.addWidget(self.zoom_label)
+        zoom_layout.addStretch(1)
 
         self.hint_label = QLabel("-")
         self.hint_label.setWordWrap(True)
@@ -276,8 +324,8 @@ class TemplateCaptureDialog(QDialog):
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel(f"所需模板（保存到 {resolution}）:"))
         left_layout.addWidget(self.template_list, 1)
-        left_layout.addWidget(QLabel("参考贴图（其他分辨率）:"))
-        left_layout.addWidget(self.reference_label)
+        left_layout.addLayout(compare_layout)
+        left_layout.addLayout(zoom_layout)
         left_layout.addWidget(self.hint_label)
 
         # 右侧: 游戏截图
@@ -316,10 +364,28 @@ class TemplateCaptureDialog(QDialog):
             item = self.template_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == name:
                 self.template_list.setCurrentItem(item)
+                return True
+        return False
+
+    def row_is_missing(self, row):
+        item = self.template_list.item(row)
+        return bool(item.data(Qt.ItemDataRole.UserRole + 1)) if item else False
+
+    def advance_to_next_missing(self):
+        """跳到当前项之后的第一个缺失模板; 后面没有缺失项就保持不动, 不往前找"""
+        current_row = self.template_list.currentRow()
+        for row in range(current_row + 1, self.template_list.count()):
+            if self.row_is_missing(row):
+                self.template_list.setCurrentRow(row)
                 return
 
-    def reload_template_list(self):
-        """刷新清单状态, 并自动选中第一个缺失的模板"""
+    def reload_template_list(self, advance=False):
+        """刷新清单状态
+
+        Args:
+            advance: True 时截取完成后向后跳到下一个缺失项; False 时保持/定位到第一个缺失项
+        """
+        current_name = self.current_template_name()
         self.template_list.clear()
         first_missing = None
 
@@ -336,40 +402,115 @@ class TemplateCaptureDialog(QDialog):
 
             item = QListWidgetItem(f"{name}  [{status}]")
             item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setData(Qt.ItemDataRole.UserRole + 1, image is None)
             self.template_list.addItem(item)
 
-        if first_missing:
+        if advance:
+            # 保留原选中项作为锚点, 只向后推进
+            if current_name and self.select_template(current_name):
+                self.advance_to_next_missing()
+        elif first_missing:
             self.select_template(first_missing)
         elif self.template_list.count():
             self.template_list.setCurrentRow(0)
 
+        # 选择未变化时 currentItemChanged 不触发, 这里显式刷新一次预览
+        self.on_template_selected(self.template_list.currentItem())
+
+    def wrap_preview(self, label):
+        """把预览标签放进可滚动容器: 小图居中, 大图或放大后可滚动查看"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setMinimumHeight(160)
+        scroll.setStyleSheet("border: 1px solid #808080;")
+        scroll.setWidget(label)
+        return scroll
+
+    def load_pixmap(self, path):
+        """读取贴图原图, 缺失或解码失败返回 None"""
+        if not path or not os.path.exists(path):
+            return None
+
+        pixmap = QPixmap(path)
+        return None if pixmap.isNull() else pixmap
+
+    def render_preview(self, label, pixmap, empty_text):
+        """按当前缩放比例渲染预览; 放大用平滑插值, 缩小/原图用快速插值"""
+        if pixmap is None:
+            label.clear()
+            label.setText(empty_text)
+            label.adjustSize()
+            return
+
+        level = self.ZOOM_LEVELS[self.zoom_index]
+        mode = (Qt.TransformationMode.FastTransformation if level >= 1.0
+                else Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(pixmap.scaled(
+            max(1, int(pixmap.width() * level)), max(1, int(pixmap.height() * level)),
+            Qt.AspectRatioMode.KeepAspectRatio, mode))
+        label.adjustSize()
+
+    def apply_zoom(self):
+        """按当前缩放比例刷新两个预览框"""
+        self.zoom_label.setText(f"{int(self.ZOOM_LEVELS[self.zoom_index] * 100)}%")
+        self.render_preview(self.current_label, self.current_pixmap, "未截取")
+        self.render_preview(self.reference_label, self.reference_pixmap, "其他分辨率无此贴图")
+
+    def change_zoom(self, step):
+        """放大/缩小一档"""
+        index = max(0, min(self.zoom_index + step, len(self.ZOOM_LEVELS) - 1))
+        if index != self.zoom_index:
+            self.zoom_index = index
+            self.apply_zoom()
+
+    def reset_zoom(self):
+        """回到 1:1 原图尺寸"""
+        self.zoom_index = self.DEFAULT_ZOOM_INDEX
+        self.apply_zoom()
+
     def on_template_selected(self, current, _previous=None):
-        """选中模板后, 显示其他分辨率下的同名贴图作参考"""
+        """选中模板后, 对比显示本分辨率已截取的贴图与其他分辨率的同名贴图"""
         if current is None:
             return
 
         name = current.data(Qt.ItemDataRole.UserRole)
+
+        # 当前目标: 本分辨率下已截取的贴图
+        self.current_pixmap = self.load_pixmap(os.path.join(self.target_dir, f"{name}.png"))
+        if self.current_pixmap:
+            current_text = f"当前 {self.current_pixmap.width()}x{self.current_pixmap.height()}"
+        else:
+            current_text = "当前未截取"
+
+        # 参考: 其他分辨率下的同名贴图
+        reference_path = None
+        reference_resolution = ""
         for resolution in self.template_engine.list_resolutions():
             if resolution == self.resolution:
                 continue
 
             path = os.path.join(self.template_engine.resolution_dir(resolution), f"{name}.png")
-            if not os.path.exists(path):
-                continue
+            if os.path.exists(path):
+                reference_path = path
+                reference_resolution = resolution
+                break
 
-            pixmap = QPixmap(path)
-            if pixmap.isNull():
-                continue
+        self.reference_pixmap = self.load_pixmap(reference_path)
+        if self.reference_pixmap:
+            reference_text = (f"参考 {reference_resolution} "
+                              f"{self.reference_pixmap.width()}x{self.reference_pixmap.height()}")
+        else:
+            reference_text = "无参考"
 
-            self.reference_label.setPixmap(pixmap.scaled(
-                260, 160, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
-            self.hint_label.setText(f"{name} 参考自 {resolution}: {pixmap.width()}x{pixmap.height()}")
-            return
+        # 标题直接写出具体分辨率, 让人一眼知道参考来自哪里
+        if reference_resolution:
+            self.reference_title.setText(f"参考（{reference_resolution}）:")
+        else:
+            self.reference_title.setText("参考（其他分辨率）:")
 
-        self.reference_label.clear()
-        self.reference_label.setText("其他分辨率无此贴图")
-        self.hint_label.setText(name)
+        self.apply_zoom()
+        self.hint_label.setText(f"{name} | {reference_text} | {current_text}")
 
     def refresh_screenshot(self):
         """重新抓取游戏窗口截图"""
@@ -406,7 +547,8 @@ class TemplateCaptureDialog(QDialog):
         if self.template_engine.resolution == self.resolution:
             self.template_engine.load_all_templates()
 
-        self.reload_template_list()
+        # 截取完成后只向后跳到下一个缺失项, 后面没有了就停在原地
+        self.reload_template_list(advance=True)
 
 
 class GameWindow:
@@ -1221,6 +1363,44 @@ class AutoTeamPirate(QThread):
         self.status_update.emit("已恢复")
 
 
+class PreviewLabel(QLabel):
+    """按自身尺寸等比缩放显示画面, 尺寸变化(窗口/分隔条)后自动重绘"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 忽略贴图自身尺寸, 否则最小值会被画面尺寸顶住, 分隔条拖不过去
+        self.setMinimumSize(1, 1)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self._source = None
+
+    def set_source_pixmap(self, pixmap):
+        """记录原图并立即渲染, 缩放始终基于原图"""
+        self._source = pixmap
+        self.render()
+
+    def render(self):
+        if self._source is None:
+            return
+
+        width, height = self.width(), self.height()
+        if width <= 1 or height <= 1:
+            return
+
+        self.setPixmap(self._source.scaled(
+            width, height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
+    def minimumSizeHint(self):
+        """不要用画面尺寸当最小尺寸, 否则分隔条会被画面顶住拖不过去"""
+        return QSize(1, 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.render()
+
+
 class MainWindow(QMainWindow):
     """主窗口类"""
 
@@ -1265,8 +1445,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("帝国刷瓶子助手")
         self.setGeometry(100, 100, 1000, 800)
 
-        # 主布局
-        main_layout = QHBoxLayout()
+        # 主布局: 用分隔条, 左侧控制面板宽度可手动拖动
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
 
         # 左侧控制区域
         control_panel = QGroupBox("控制面板")
@@ -1367,9 +1548,9 @@ class MainWindow(QMainWindow):
         self.capture_template_button.clicked.connect(self.capture_new_template)
         template_button_layout.addWidget(self.capture_template_button)
 
-        self.browse_templates_button = QPushButton("浏览模板")
-        self.browse_templates_button.clicked.connect(self.browse_templates)
-        template_button_layout.addWidget(self.browse_templates_button)
+        self.edit_templates_button = QPushButton("编辑模板")
+        self.edit_templates_button.clicked.connect(self.edit_templates)
+        template_button_layout.addWidget(self.edit_templates_button)
 
         template_layout.addLayout(template_button_layout)
         template_group.setLayout(template_layout)
@@ -1385,21 +1566,28 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(log_group, 1)
 
         control_panel.setLayout(control_layout)
-        main_layout.addWidget(control_panel, 1)
+        control_panel.setMinimumWidth(200)
+        self.splitter.addWidget(control_panel)
 
         # 右侧截图区域
         screen_panel = QGroupBox("当前画面")
         screen_layout = QVBoxLayout()
-        self.screen_label = QLabel()
-        self.screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        screen_layout.addWidget(self.screen_label)
+        self.screen_label = PreviewLabel()
+        screen_layout.addWidget(self.screen_label, 1)
+
+        self.refresh_screen_button = QPushButton("刷新当前画面")
+        self.refresh_screen_button.clicked.connect(self.refresh_screen)
+        screen_layout.addWidget(self.refresh_screen_button)
+
         screen_panel.setLayout(screen_layout)
-        main_layout.addWidget(screen_panel, 2)
+        self.splitter.addWidget(screen_panel)
 
         # 设置中央窗口部件
-        central_widget = QWidget()
-        central_widget.setLayout(main_layout)
-        self.setCentralWidget(central_widget)
+        # 左面板 stretch 0: 窗口缩放时宽度保持不变, 多出的空间全给右侧画面
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([330, 670])
+        self.setCentralWidget(self.splitter)
 
         self.screenshot_update.connect(self.update_screenshot)
 
@@ -1466,13 +1654,17 @@ class MainWindow(QMainWindow):
 
     def update_screenshot(self, pixmap):
         """更新截图显示"""
-        scaled_pixmap = pixmap.scaled(
-            self.screen_label.width(),
-            self.screen_label.height(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.screen_label.setPixmap(scaled_pixmap)
+        self.screen_label.set_source_pixmap(pixmap)
+
+    def refresh_screen(self):
+        """刷新右侧当前画面预览"""
+        if not self.game_window.is_valid():
+            self.add_log("游戏窗口无效，请先选择窗口")
+            return
+
+        # capture_screenshot 内部会通过信号把截图送到 update_screenshot
+        if self.game_window.capture_screenshot() is None:
+            self.add_log("刷新当前画面失败")
 
     def start_automation(self):
         """开始自动化流程"""
@@ -1566,18 +1758,23 @@ class MainWindow(QMainWindow):
 
         self.refresh_resolution_combo()
 
-    def browse_templates(self):
-        """浏览已有模板"""
-        template_dir = os.path.abspath(self.template_engine.templates_root)
-        if os.path.exists(template_dir):
-            if sys.platform == 'win32':
-                os.startfile(template_dir)
-            else:
-                import subprocess
-                subprocess.Popen(['xdg-open', template_dir])
-            self.add_log(f"已打开模板目录: {template_dir}")
-        else:
-            self.add_log(f"模板目录不存在: {template_dir}")
+    def edit_templates(self):
+        """打开当前模板目录的截取窗口, 用于查看或重新截取已有贴图"""
+        resolution = self.resolution_combo.currentText()
+        if not resolution:
+            self.add_log("没有可编辑的模板目录")
+            return
+
+        if not self.game_window.is_valid():
+            self.add_log("游戏窗口无效，请先选择窗口")
+            return
+
+        self.add_log(f"开始编辑模板: {resolution}")
+        dialog = TemplateCaptureDialog(self.game_window, self.template_engine, resolution, self)
+        dialog.exec()
+
+        self.refresh_resolution_combo()
+        self.add_log(f"{resolution} 编辑结束")
 
     def on_open_bottle_checkbox(self, state):
         if state == Qt.CheckState.Checked:
