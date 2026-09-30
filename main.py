@@ -11,10 +11,11 @@ import logging
 import win32ui
 from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QLabel, QTextEdit, QComboBox,
+                               QPushButton, QLabel, QTextEdit, QComboBox, QInputDialog,
+                               QMessageBox, QListWidgetItem,
                                QGroupBox, QListWidget, QDialog, QDialogButtonBox, QCheckBox, QLineEdit)
-from PySide6.QtCore import Qt, QTimer, Signal, QThread
-from PySide6.QtGui import QPixmap, QImage, QIcon
+from PySide6.QtCore import QRect, QSettings, Qt, QTimer, Signal, QThread
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QImage, QIcon
 
 from PIL import Image
 from mouse import send_input_click, send_input_rclick
@@ -145,6 +146,267 @@ class WindowSelector(QDialog):
         if current_index >= 0 and current_index in self.window_info:
             return self.window_info[current_index]
         return None, None
+
+
+class CaptureLabel(QLabel):
+    """显示游戏截图, 支持拖拽框选, 选中区域坐标以原图为准"""
+
+    region_selected = Signal(int, int, int, int)  # x1, y1, x2, y2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(320, 240)
+        self._pixmap = None
+        self._scale = 1.0
+        self._offset = (0.0, 0.0)
+        self._start = None
+        self._end = None
+
+    def set_image(self, pixmap):
+        self._pixmap = pixmap
+        self._start = None
+        self._end = None
+        self._update_geometry()
+        self.update()
+
+    def _update_geometry(self):
+        """按控件大小等比缩放图片, 记录缩放比与居中偏移"""
+        if self._pixmap is None:
+            return
+
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        if pw <= 0 or ph <= 0:
+            return
+
+        self._scale = min(self.width() / pw, self.height() / ph)
+        self._offset = ((self.width() - pw * self._scale) / 2,
+                        (self.height() - ph * self._scale) / 2)
+
+    def resizeEvent(self, event):
+        self._update_geometry()
+        super().resizeEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._pixmap is None:
+            return
+
+        painter = QPainter(self)
+        painter.drawPixmap(
+            int(self._offset[0]), int(self._offset[1]),
+            int(self._pixmap.width() * self._scale), int(self._pixmap.height() * self._scale),
+            self._pixmap)
+
+        if self._start is not None and self._end is not None:
+            painter.setPen(QPen(QColor(255, 64, 64), 2))
+            painter.drawRect(QRect(self._start, self._end).normalized())
+
+    def _to_image_pos(self, pos):
+        """控件坐标 -> 原图坐标"""
+        if self._pixmap is None or self._scale <= 0:
+            return 0, 0
+
+        x = (pos.x() - self._offset[0]) / self._scale
+        y = (pos.y() - self._offset[1]) / self._scale
+        x = max(0, min(int(round(x)), self._pixmap.width()))
+        y = max(0, min(int(round(y)), self._pixmap.height()))
+        return x, y
+
+    def mousePressEvent(self, event):
+        if self._pixmap is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._start = event.pos()
+        self._end = event.pos()
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._start is None:
+            return
+        self._end = event.pos()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._start is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        self._end = event.pos()
+        x1, y1 = self._to_image_pos(self._start)
+        x2, y2 = self._to_image_pos(self._end)
+        self._start = None
+        self._end = None
+        self.update()
+
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        if right - left >= 2 and bottom - top >= 2:
+            self.region_selected.emit(left, top, right, bottom)
+
+
+class TemplateCaptureDialog(QDialog):
+    """模板截取对话框: 按所需模板清单, 从游戏截图截取贴图存为指定分辨率"""
+
+    def __init__(self, game_window, template_engine, resolution, parent=None):
+        super().__init__(parent)
+        self.game_window = game_window
+        self.template_engine = template_engine
+        self.resolution = resolution
+        self.target_dir = template_engine.resolution_dir(resolution)
+        self.screenshot = None
+
+        self.setWindowTitle(f"截取模板 - {resolution}")
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setSizeGripEnabled(True)
+        self.resize(1200, 720)
+        os.makedirs(self.target_dir, exist_ok=True)
+
+        # 左侧: 所需模板清单 + 参考贴图
+        self.template_list = QListWidget()
+        self.template_list.currentItemChanged.connect(self.on_template_selected)
+
+        self.reference_label = QLabel("其他分辨率无此贴图")
+        self.reference_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.reference_label.setMinimumHeight(160)
+        self.reference_label.setStyleSheet("border: 1px solid #808080;")
+
+        self.hint_label = QLabel("-")
+        self.hint_label.setWordWrap(True)
+
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(QLabel(f"所需模板（保存到 {resolution}）:"))
+        left_layout.addWidget(self.template_list, 1)
+        left_layout.addWidget(QLabel("参考贴图（其他分辨率）:"))
+        left_layout.addWidget(self.reference_label)
+        left_layout.addWidget(self.hint_label)
+
+        # 右侧: 游戏截图
+        self.capture_label = CaptureLabel()
+        self.capture_label.region_selected.connect(self.save_region)
+
+        self.refresh_button = QPushButton("刷新游戏截图")
+        self.refresh_button.clicked.connect(self.refresh_screenshot)
+
+        self.close_button = QPushButton("关闭")
+        self.close_button.clicked.connect(self.accept)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.refresh_button)
+        button_layout.addWidget(self.close_button)
+
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(QLabel("在截图上拖拽框选贴图，松手即保存为左侧选中的模板"))
+        right_layout.addWidget(self.capture_label, 1)
+        right_layout.addLayout(button_layout)
+
+        layout = QHBoxLayout()
+        layout.addLayout(left_layout, 1)
+        layout.addLayout(right_layout, 3)
+        self.setLayout(layout)
+
+        self.reload_template_list()
+        self.refresh_screenshot()
+
+    def current_template_name(self):
+        item = self.template_list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def select_template(self, name):
+        for row in range(self.template_list.count()):
+            item = self.template_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == name:
+                self.template_list.setCurrentItem(item)
+                return
+
+    def reload_template_list(self):
+        """刷新清单状态, 并自动选中第一个缺失的模板"""
+        self.template_list.clear()
+        first_missing = None
+
+        for name in self.template_engine.list_template_names():
+            path = os.path.join(self.target_dir, f"{name}.png")
+            image = cv2.imread(path) if os.path.exists(path) else None
+
+            if image is None:
+                status = "缺失"
+                if first_missing is None:
+                    first_missing = name
+            else:
+                status = f"已截取 {image.shape[1]}x{image.shape[0]}"
+
+            item = QListWidgetItem(f"{name}  [{status}]")
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            self.template_list.addItem(item)
+
+        if first_missing:
+            self.select_template(first_missing)
+        elif self.template_list.count():
+            self.template_list.setCurrentRow(0)
+
+    def on_template_selected(self, current, _previous=None):
+        """选中模板后, 显示其他分辨率下的同名贴图作参考"""
+        if current is None:
+            return
+
+        name = current.data(Qt.ItemDataRole.UserRole)
+        for resolution in self.template_engine.list_resolutions():
+            if resolution == self.resolution:
+                continue
+
+            path = os.path.join(self.template_engine.resolution_dir(resolution), f"{name}.png")
+            if not os.path.exists(path):
+                continue
+
+            pixmap = QPixmap(path)
+            if pixmap.isNull():
+                continue
+
+            self.reference_label.setPixmap(pixmap.scaled(
+                260, 160, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            self.hint_label.setText(f"{name} 参考自 {resolution}: {pixmap.width()}x{pixmap.height()}")
+            return
+
+        self.reference_label.clear()
+        self.reference_label.setText("其他分辨率无此贴图")
+        self.hint_label.setText(name)
+
+    def refresh_screenshot(self):
+        """重新抓取游戏窗口截图"""
+        screenshot = self.game_window.capture_screenshot()
+        if screenshot is None:
+            self.hint_label.setText("截图失败，请确认游戏窗口有效")
+            return
+
+        self.screenshot = screenshot
+        h, w = screenshot.shape[:2]
+        q_img = QImage(screenshot.data, w, h, 3 * w, QImage.Format.Format_RGB888).rgbSwapped()
+        self.capture_label.set_image(QPixmap.fromImage(q_img))
+
+    def save_region(self, x1, y1, x2, y2):
+        """把框选区域存为当前选中模板对应的贴图"""
+        name = self.current_template_name()
+        if not name:
+            QMessageBox.warning(self, "提示", "请先在左侧选择要保存的模板名")
+            return
+
+        if self.screenshot is None:
+            return
+
+        region = self.screenshot[y1:y2, x1:x2]
+        if region.size == 0:
+            return
+
+        os.makedirs(self.target_dir, exist_ok=True)
+        path = os.path.join(self.target_dir, f"{name}.png")
+        cv2.imwrite(path, region)
+        logger.info(f"已保存模板贴图: {path}, 尺寸: {x2 - x1}x{y2 - y1}")
+
+        # 截取的正是当前使用的分辨率目录, 立即重载供主流程使用
+        if self.template_engine.resolution == self.resolution:
+            self.template_engine.load_all_templates()
+
+        self.reload_template_list()
 
 
 class GameWindow:
@@ -347,28 +609,78 @@ class GameWindow:
 class TemplateMatchingEngine:
     """模板匹配引擎类"""
 
+    DEFAULT_RESOLUTION = "1366x768"
+
     def __init__(self, templates_dir=None, threshold=0.85):
         """
         初始化模板匹配引擎
 
         Args:
-            templates_dir: 模板图片目录
+            templates_dir: 模板根目录(其下按分辨率分子目录)
             threshold: 匹配阈值
         """
-        self.templates_dir = templates_dir or get_resource_path("templates")
+        self.templates_root = templates_dir or get_resource_path("templates")
         self.threshold = threshold
         self.templates = {}
         self.template_dimensions = {}
+        self.resolution = None
+        self.templates_dir = self.templates_root
 
-        # 确保模板目录存在
-        if not os.path.exists(self.templates_dir):
-            os.makedirs(self.templates_dir)
-            logger.info(f"创建模板目录: {self.templates_dir}")
+        # 确保模板根目录存在
+        if not os.path.exists(self.templates_root):
+            os.makedirs(self.templates_root)
+            logger.info(f"创建模板目录: {self.templates_root}")
 
+        resolution = self.default_resolution()
+        if resolution:
+            self.set_resolution(resolution)
+        else:
+            self.load_all_templates()
+
+    def list_resolutions(self):
+        """列出模板根目录下的分辨率子目录"""
+        if not os.path.isdir(self.templates_root):
+            return []
+
+        return sorted(name for name in os.listdir(self.templates_root)
+                      if os.path.isdir(os.path.join(self.templates_root, name)))
+
+    def default_resolution(self):
+        """默认分辨率: 优先 1366x768, 否则取第一个子目录; 无子目录返回 None"""
+        names = self.list_resolutions()
+        if self.DEFAULT_RESOLUTION in names:
+            return self.DEFAULT_RESOLUTION
+        return names[0] if names else None
+
+    def set_resolution(self, resolution):
+        """切换分辨率目录并重载模板"""
+        self.resolution = resolution
+        if resolution:
+            self.templates_dir = os.path.join(self.templates_root, resolution)
+        else:
+            self.templates_dir = self.templates_root
+
+        logger.info(f"切换模板目录: {self.templates_dir}")
         self.load_all_templates()
+
+    def list_template_names(self):
+        """所有分辨率目录下出现过的模板名(并集), 用于模板截取界面"""
+        names = set()
+        for resolution in self.list_resolutions():
+            path = os.path.join(self.templates_root, resolution)
+            for filename in os.listdir(path):
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    names.add(os.path.splitext(filename)[0])
+        return sorted(names)
+
+    def resolution_dir(self, resolution):
+        return os.path.join(self.templates_root, resolution)
 
     def load_all_templates(self):
         """加载所有模板图片"""
+        self.templates = {}
+        self.template_dimensions = {}
+
         if not os.path.exists(self.templates_dir):
             logger.error(f"模板目录不存在: {self.templates_dir}")
             return
@@ -916,12 +1228,20 @@ class MainWindow(QMainWindow):
 
     def __init__(self, monitor_titles=("AoE", "云重返帝国")):
         super().__init__()
+        self.settings = QSettings("BrushBottle", "AutoPirateTeam")
         self.template_engine = TemplateMatchingEngine()
         self.game_window = GameWindow()
         self.auto_thread = None
 
+        self.load_settings()
         self.init_ui()
         self.init_window(monitor_titles)
+
+    def load_settings(self):
+        """恢复上次选择的模板目录"""
+        resolution = self.settings.value("templates/resolution", "")
+        if resolution and resolution in self.template_engine.list_resolutions():
+            self.template_engine.set_resolution(resolution)
 
     def init_window(self, monitor_titles):
         try:
@@ -968,12 +1288,6 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_automation)
         self.start_button.setEnabled(False)  # 初始禁用
         control_layout.addWidget(self.start_button)
-
-        # 暂停/继续按钮
-        self.pause_button = QPushButton("暂停 (Ctrl+F7)")
-        self.pause_button.setEnabled(False)
-        self.pause_button.clicked.connect(self.toggle_pause)
-        control_layout.addWidget(self.pause_button)
 
         # 停止按钮
         self.stop_button = QPushButton("停止 (Ctrl+F8)")
@@ -1041,8 +1355,15 @@ class MainWindow(QMainWindow):
         template_group = QGroupBox("模板管理")
         template_layout = QVBoxLayout()
 
+        resolution_layout = QHBoxLayout()
+        resolution_layout.addWidget(QLabel("模板目录:"))
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.currentTextChanged.connect(self.on_resolution_changed)
+        resolution_layout.addWidget(self.resolution_combo, 1)
+        template_layout.addLayout(resolution_layout)
+
         template_button_layout = QHBoxLayout()
-        self.capture_template_button = QPushButton("截取新模板")
+        self.capture_template_button = QPushButton("新增模板")
         self.capture_template_button.clicked.connect(self.capture_new_template)
         template_button_layout.addWidget(self.capture_template_button)
 
@@ -1085,16 +1406,17 @@ class MainWindow(QMainWindow):
         # 注册全局热键
         self.register_hotkeys()
 
+        # 模板分辨率下拉框
+        self.refresh_resolution_combo()
+
         # 添加日志信息
         self.add_log("程序已启动")
-        self.add_log(f"已加载 {len(self.template_engine.templates)} 个模板")
+        self.add_log(f"模板目录 {self.template_engine.resolution}，已加载 {len(self.template_engine.templates)} 个模板")
 
     def register_hotkeys(self):
         try:
             # 注册 Ctrl+F6 为开始热键
             win32gui.RegisterHotKey(int(self.winId()), 1, win32con.MOD_CONTROL, win32con.VK_F6)
-            # 注册 Ctrl+F7 为暂停/继续热键
-            win32gui.RegisterHotKey(int(self.winId()), 2, win32con.MOD_CONTROL, win32con.VK_F7)
             # 注册 Ctrl+F8 为停止热键
             win32gui.RegisterHotKey(int(self.winId()), 3, win32con.MOD_CONTROL, win32con.VK_F8)
         except Exception as e:
@@ -1108,18 +1430,15 @@ class MainWindow(QMainWindow):
                 if msg.wParam == 1:  # Ctrl+F6
                     self.start_automation()
                     return True, 0
-                elif msg.wParam == 2:  # Ctrl+F7
-                    self.toggle_pause()
-                    return True, 0
                 elif msg.wParam == 3:  # Ctrl+F8
                     self.stop_automation()
                     return True, 0
         return super().nativeEvent(eventType, message)
 
     def closeEvent(self, event):
-        # 注销所有热键
-        for i in range(1, 4):
-            win32gui.UnregisterHotKey(int(self.winId()), i)
+        # 注销热键
+        for hotkey_id in (1, 3):
+            win32gui.UnregisterHotKey(int(self.winId()), hotkey_id)
         super().closeEvent(event)
 
     def select_game_window(self):
@@ -1168,30 +1487,15 @@ class MainWindow(QMainWindow):
             self.auto_thread.start()
 
             self.start_button.setEnabled(False)
-            self.pause_button.setEnabled(True)
             self.stop_button.setEnabled(True)
             self.add_log("自动化流程已启动")
-
-    def toggle_pause(self):
-        """切换暂停/继续状态"""
-        if self.auto_thread and self.auto_thread.isRunning():
-            if self.auto_thread.paused:
-                self.auto_thread.resume()
-                self.pause_button.setText("暂停(Ctrl+F7)")
-                self.add_log("自动化流程已恢复")
-            else:
-                self.auto_thread.pause()
-                self.pause_button.setText("继续(Ctrl+F7)")
-                self.add_log("自动化流程已暂停")
 
     def stop_automation(self):
         """停止自动化流程"""
         if self.auto_thread and self.auto_thread.isRunning():
             self.auto_thread.stop()
             self.start_button.setEnabled(True)
-            self.pause_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-            self.pause_button.setText("暂停(Ctrl+F7)")
             self.add_log("自动化流程已停止")
 
     def test_template(self):
@@ -1213,20 +1517,58 @@ class MainWindow(QMainWindow):
     def open_bottle(self):
         self.auto_thread.force_open_bottle = True
 
+    def refresh_resolution_combo(self):
+        """刷新模板目录下拉框"""
+        combo = self.resolution_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(self.template_engine.list_resolutions())
+        if self.template_engine.resolution:
+            combo.setCurrentText(self.template_engine.resolution)
+        combo.blockSignals(False)
+
+    def on_resolution_changed(self, resolution):
+        """切换模板目录并重载模板"""
+        if not resolution or resolution == self.template_engine.resolution:
+            return
+
+        self.template_engine.set_resolution(resolution)
+        self.settings.setValue("templates/resolution", resolution)
+        self.add_log(f"已切换模板目录 {resolution}，加载 {len(self.template_engine.templates)} 个模板")
+
     def capture_new_template(self):
-        """截取新模板"""
+        """新增分辨率模板目录, 并进入截取贴图的界面"""
         if not self.game_window.is_valid():
             self.add_log("游戏窗口无效，请先选择窗口")
             return
 
-        # 这里可以实现一个模板截取功能
-        # 例如让用户在当前游戏窗口截图上选择区域，然后保存为新模板
-        self.add_log("模板截取功能待实现")
+        resolution, accepted = QInputDialog.getText(
+            self, "新增模板", "模板名称（如 1920x1080）:")
+        if not accepted:
+            return
+
+        resolution = resolution.strip()
+        if not resolution or os.sep in resolution or '/' in resolution:
+            self.add_log(f"模板名称非法: {resolution}")
+            return
+
+        os.makedirs(self.template_engine.resolution_dir(resolution), exist_ok=True)
+        self.add_log(f"开始截取模板: {resolution}")
+
+        dialog = TemplateCaptureDialog(self.game_window, self.template_engine, resolution, self)
+        dialog.exec()
+
+        target_dir = self.template_engine.resolution_dir(resolution)
+        saved = len([f for f in os.listdir(target_dir)
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        total = len(self.template_engine.list_template_names())
+        self.add_log(f"{resolution} 截取结束: {saved}/{total}")
+
+        self.refresh_resolution_combo()
 
     def browse_templates(self):
         """浏览已有模板"""
-        # 打开模板目录
-        template_dir = os.path.abspath(self.template_engine.templates_dir)
+        template_dir = os.path.abspath(self.template_engine.templates_root)
         if os.path.exists(template_dir):
             if sys.platform == 'win32':
                 os.startfile(template_dir)
