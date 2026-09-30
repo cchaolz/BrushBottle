@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 import cv2
 import numpy as np
 import pyautogui
@@ -10,10 +11,10 @@ import logging
 import win32ui
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QTextEdit,
+                             QPushButton, QLabel, QTextEdit, QComboBox,
                              QGroupBox, QListWidget, QDialog, QDialogButtonBox, QCheckBox, QLineEdit)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt5.QtGui import QPixmap, QImage, QIntValidator
+from PyQt5.QtGui import QPixmap, QImage, QIcon
 
 from PIL import Image
 from mouse import send_input_click, send_input_rclick
@@ -22,13 +23,31 @@ import ctypes
 # PrintWindow 标志: 读取 GPU/DirectX 渲染内容
 PW_RENDERFULLCONTENT = 0x00000002
 
+
+def is_packaged():
+    """是否处于打包后的运行环境(PyInstaller / Nuitka)"""
+    return getattr(sys, 'frozen', False) or '__compiled__' in globals()
+
+
+PACKAGED = is_packaged()
+
+
+def get_base_dir():
+    """程序根目录: 打包后为 exe 所在目录, 否则为脚本所在目录"""
+    if PACKAGED:
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = get_base_dir()
+
 window = None
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("auto_pirate_team.log"),
+        logging.FileHandler(os.path.join(BASE_DIR, "auto_pirate_team.log")),
         logging.StreamHandler()
     ]
 )
@@ -293,7 +312,7 @@ class GameWindow:
 class TemplateMatchingEngine:
     """模板匹配引擎类"""
 
-    def __init__(self, templates_dir="templates", threshold=0.85):
+    def __init__(self, templates_dir=None, threshold=0.85):
         """
         初始化模板匹配引擎
 
@@ -301,15 +320,15 @@ class TemplateMatchingEngine:
             templates_dir: 模板图片目录
             threshold: 匹配阈值
         """
-        self.templates_dir = templates_dir
+        self.templates_dir = templates_dir or os.path.join(BASE_DIR, "templates")
         self.threshold = threshold
         self.templates = {}
         self.template_dimensions = {}
 
         # 确保模板目录存在
-        if not os.path.exists(templates_dir):
-            os.makedirs(templates_dir)
-            logger.info(f"创建模板目录: {templates_dir}")
+        if not os.path.exists(self.templates_dir):
+            os.makedirs(self.templates_dir)
+            logger.info(f"创建模板目录: {self.templates_dir}")
 
         self.load_all_templates()
 
@@ -581,13 +600,15 @@ class AutoTeamPirate(QThread):
 
         # 防卡死
         self.count += 1
-        nPerCount = int(window.freeze_protection_edit.text())
-        if nPerCount > 0 and self.count % nPerCount == 0:
+        if self.count % 1000 == 0:
             self.log_message.emit("返回一下，防卡死")
             self.back()  # 返回一下避免卡死
 
         if self.force_open_bottle or self.idle_count >= 10:
             self.try_open_bottle()
+
+        if bAnySuccess:
+            time.sleep(1)
 
         # if self.game_window.is_foreground():
         #     self.game_window.click((0, -20), up=False)
@@ -709,6 +730,12 @@ class AutoTeamPirate(QThread):
         """处理加入队伍流程"""
         screenshot = self.game_window.capture_screenshot()
 
+        # 队伍数量已达设定值，本次不操作
+        nTeamCount = int(window.team_count_combo.currentText())
+        if len(self.template_engine.find_all_templates("inteam", screenshot)) >= nTeamCount:
+            self.log_message.emit(f"当前队伍数量已达 {nTeamCount}，本次不操作")
+            return True
+
         # 查找所有可加入的队伍
         self.status_update.emit("正在查找可加入的队伍...")
         matches = self.template_engine.find_all_templates("canjoin", screenshot, threshold=0.8)
@@ -718,7 +745,7 @@ class AutoTeamPirate(QThread):
             bInWarsWindow = self.find_template("inwars", log=False)
             if bInWarsWindow:
                 inteam_matches = self.template_engine.find_all_templates("inteam", screenshot)
-                if len(inteam_matches) < 5:
+                if len(inteam_matches) < nTeamCount:
                     self.idle_count += 1
             return bInWarsWindow
 
@@ -940,14 +967,13 @@ class MainWindow(QMainWindow):
         self.open_activity_bottle_checkbox.stateChanged.connect(self.on_open_activity_bottle_checkbox)
         window_layout.addWidget(self.open_activity_bottle_checkbox)
 
-        # 防卡死数字编辑框
+        # 当前队伍数量选择框
         window_layout = QHBoxLayout()
-        self.freeze_protection_text = QLabel("防卡死间隔（10~9999）")
-        window_layout.addWidget(self.freeze_protection_text)
-        self.freeze_protection_edit = QLineEdit("1000")
-        self.freeze_protection_edit.setPlaceholderText("（10~9999）")
-        self.freeze_protection_edit.setValidator(QIntValidator(10, 9999))
-        window_layout.addWidget(self.freeze_protection_edit, 1)
+        window_layout.addWidget(QLabel("当前队伍数量（1~5）"))
+        self.team_count_combo = QComboBox()
+        self.team_count_combo.addItems(["1", "2", "3", "4", "5"])
+        self.team_count_combo.setCurrentText("5")
+        window_layout.addWidget(self.team_count_combo, 1)
         control_layout.addLayout(window_layout)
 
         window_layout = QHBoxLayout()
@@ -1188,8 +1214,41 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def is_admin():
+    """当前是否以管理员权限运行"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def run_as_admin():
+    """以管理员权限重新启动自身"""
+    executable = sys.executable
+    if PACKAGED:
+        args = sys.argv[1:]
+    else:
+        args = [os.path.abspath(__file__)] + sys.argv[1:]
+
+    params = subprocess.list2cmdline(args)
+    try:
+        # 返回码 <= 32 表示失败（例如用户取消了 UAC 提示）
+        # 显式传入程序目录，保证提权后 templates、日志路径一致
+        return ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, params, BASE_DIR, 1) > 32
+    except Exception as e:
+        logger.error(f"请求管理员权限失败: {e}")
+        return False
+
+
 if __name__ == "__main__":
+    if not is_admin():
+        if run_as_admin():
+            sys.exit(0)
+        logger.warning("未获得管理员权限，继续以普通权限运行")
+
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(os.path.join(BASE_DIR, "icon.png")))
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
